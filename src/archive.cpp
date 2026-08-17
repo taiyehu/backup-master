@@ -8,6 +8,11 @@
 #include <stdexcept>
 #include <system_error>
 #include <vector>
+#include <chrono>
+#include <ctime>
+#include <iomanip>
+#include <sstream>
+#include <string>
 
 namespace backup {
 namespace {
@@ -21,6 +26,7 @@ constexpr std::uint64_t kMaxEntries = 10'000'000ULL;
 constexpr std::uint64_t kFnvOffset = 14695981039346656037ULL;
 constexpr std::uint64_t kFnvPrime = 1099511628211ULL;
 constexpr std::size_t kBufferSize = 64U * 1024U;
+const fs::path kDefaultBackupDirectory = "backup";
 
 enum class EntryType : std::uint8_t { file = 1, directory = 2 };
 
@@ -277,10 +283,39 @@ std::ifstream open_archive(const fs::path& archive) {
     return input;
 }
 
+std::string current_time_string() {
+    const auto now = std::chrono::system_clock::now();
+    const std::time_t time = std::chrono::system_clock::to_time_t(now);
+    std::tm local_time{};
+#ifdef _WIN32
+    localtime_s(&local_time, &time);
+#else
+    localtime_r(&time, &local_time);
+#endif
+
+    std::ostringstream stream;
+    stream << std::put_time(&local_time, "%Y%m%d-%H%M%S");
+    return stream.str();
+}
+
+fs::path make_default_archive_path() {
+    const std::string stem = "backup-" + current_time_string();
+    fs::path candidate = kDefaultBackupDirectory / (stem + ".bkm");
+    for (std::uint32_t suffix = 1; fs::exists(candidate); ++suffix) {
+        candidate = kDefaultBackupDirectory /
+                    (stem + "-" + std::to_string(suffix) + ".bkm");
+    }
+    return candidate;
+}
+
 }  // namespace
 
-void ArchiveService::backup(const fs::path& source, const fs::path& archive) const {
+fs::path ArchiveService::backup(const fs::path& source,
+                                const fs::path& requested_archive) const {
     const auto entries = scan_source(source);
+    const fs::path archive = requested_archive.empty()
+                                 ? make_default_archive_path()
+                                 : requested_archive;
     if (fs::exists(archive)) {
         fail("archive already exists; choose a new path or remove it explicitly");
     }
@@ -325,6 +360,7 @@ void ArchiveService::backup(const fs::path& source, const fs::path& archive) con
         fs::remove(archive, ignored);
         throw;
     }
+    return archive;
 }
 
 std::vector<EntryInfo> ArchiveService::list(const fs::path& archive) const {
@@ -432,4 +468,3 @@ void ArchiveService::restore(const fs::path& archive,
 }
 
 }  // namespace backup
-

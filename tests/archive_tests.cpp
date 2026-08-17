@@ -30,6 +30,18 @@ std::string read_file(const fs::path& path) {
     return {std::istreambuf_iterator<char>(input), std::istreambuf_iterator<char>()};
 }
 
+class CurrentPathGuard {
+public:
+    CurrentPathGuard() : original_(fs::current_path()) {}
+    ~CurrentPathGuard() {
+        std::error_code ignored;
+        fs::current_path(original_, ignored);
+    }
+
+private:
+    fs::path original_;
+};
+
 int main() {
     const auto unique = std::chrono::steady_clock::now().time_since_epoch().count();
     const auto root = fs::temp_directory_path() /
@@ -47,7 +59,8 @@ int main() {
         }
 
         const backup::ArchiveService service;
-        service.backup(source, archive);
+        require(service.backup(source, archive) == archive,
+                "backup did not return the requested archive path");
         service.verify(archive);
         const auto entries = service.list(archive);
         require(entries.size() == 5, "unexpected entry count");
@@ -72,6 +85,19 @@ int main() {
         }
         require_throws([&] { service.verify(archive); },
                        "verify accepted an archive with trailing data");
+
+        {
+            CurrentPathGuard current_path_guard;
+            fs::current_path(root);
+            const auto default_archive = service.backup(source);
+            require(default_archive.parent_path() == fs::path("backup"),
+                    "default archive was created outside the backup directory");
+            require(default_archive.extension() == ".bkm",
+                    "default archive does not use the .bkm extension");
+            require(fs::is_regular_file(default_archive),
+                    "default archive was not created");
+            service.verify(default_archive);
+        }
 
         fs::remove_all(root);
         std::cout << "All archive tests passed\n";

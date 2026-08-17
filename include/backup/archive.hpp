@@ -16,8 +16,9 @@ struct EntryInfo {
 
 class ArchiveService {
 public:
-    void backup(const std::filesystem::path& source,
-                const std::filesystem::path& archive) const;
+    std::filesystem::path backup(
+        const std::filesystem::path& source,
+        const std::filesystem::path& archive = {}) const;
 
     void restore(const std::filesystem::path& archive,
                  const std::filesystem::path& destination) const;
@@ -29,4 +30,3 @@ public:
 };
 
 }  // namespace backup
-

@@ -11,7 +11,7 @@ namespace {
 void print_usage(std::ostream& out) {
     out << "BackupMaster 0.1.0\n"
         << "Usage:\n"
-        << "  backup-master backup <source-directory> <archive.bkm>\n"
+        << "  backup-master backup <source-directory> [archive.bkm]\n"
         << "  backup-master restore <archive.bkm> <destination-directory>\n"
         << "  backup-master list <archive.bkm>\n"
         << "  backup-master verify <archive.bkm>\n";
@@ -29,9 +29,12 @@ int main(int argc, char* argv[]) {
         const std::string command = argv[1];
         const backup::ArchiveService service;
 
-        if (command == "backup" && argc == 4) {
-            service.backup(argv[2], argv[3]);
-            std::cout << "Backup created: " << argv[3] << '\n';
+        if (command == "backup" && (argc == 3 || argc == 4)) {
+            const std::filesystem::path requested_archive =
+                argc == 4 ? std::filesystem::path(argv[3])
+                          : std::filesystem::path{};
+            const auto archive = service.backup(argv[2], requested_archive);
+            std::cout << "Backup created: " << archive.string() << '\n';
             return 0;
         }
         if (command == "restore" && argc == 4) {
@@ -63,4 +66,3 @@ int main(int argc, char* argv[]) {
         return 1;
     }
 }
-
