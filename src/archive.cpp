@@ -235,6 +235,11 @@ std::uint64_t checksum_file(const fs::path& path) {
     return checksum;
 }
 
+/*
+    这里copy_exact被备份，恢复和校验方法调用，其中output作为指针类型，允许输入是nullptr
+        指向一个输出流 → 写出数据 （backup / restore）
+        nullptr     → 不写出数据 （verify）
+*/
 void copy_exact(std::istream& input, std::ostream* output, std::uint64_t size,
                 std::uint64_t& checksum) {
     std::array<char, kBufferSize> buffer{};
