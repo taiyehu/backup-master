@@ -8,8 +8,22 @@
 
 namespace {
 
+const char* type_name(backup::EntryType type) {
+    switch (type) {
+    case backup::EntryType::file:
+        return "FILE";
+    case backup::EntryType::directory:
+        return "DIR";
+    case backup::EntryType::file_symlink:
+        return "SYMLINK";
+    case backup::EntryType::directory_symlink:
+        return "DIRLINK";
+    }
+    return "UNKNOWN";
+}
+
 void print_usage(std::ostream& out) {
-    out << "BackupMaster 0.1.0\n"
+    out << "BackupMaster 0.2.0\n"
         << "Usage:\n"
         << "  backup-master backup <source-directory> [archive.bkm]\n"
         << "  backup-master restore <archive.bkm> <destination-directory>\n"
@@ -46,9 +60,13 @@ int main(int argc, char* argv[]) {
             const auto entries = service.list(argv[2]);
             std::cout << "TYPE  " << std::setw(12) << "SIZE" << "  PATH\n";
             for (const auto& entry : entries) {
-                std::cout << (entry.is_directory ? "DIR " : "FILE")
-                          << "  " << std::setw(12) << entry.size << "  "
-                          << entry.path << '\n';
+                std::cout << std::left << std::setw(8) << type_name(entry.type)
+                          << std::right << std::setw(12) << entry.size << "  "
+                          << entry.path;
+                if (backup::is_symlink(entry.type)) {
+                    std::cout << " -> " << entry.link_target;
+                }
+                std::cout << '\n';
             }
             std::cout << entries.size() << " entries\n";
             return 0;
