@@ -1,5 +1,7 @@
 #include "backup/archive.hpp"
 #include "backup/symlink.hpp"
+#include "metadata.hpp"
+#include "special_files.hpp"
 
 #include <algorithm>
 #include <chrono>
@@ -7,6 +9,7 @@
 #include <filesystem>
 #include <fstream>
 #include <iostream>
+#include <limits>
 #include <stdexcept>
 #include <string>
 #include <system_error>
@@ -38,6 +41,13 @@ template <typename UInt>
 void write_unsigned(std::ostream& output, UInt value) {
     for (std::size_t i = 0; i < sizeof(UInt); ++i) {
         output.put(static_cast<char>((value >> (i * 8U)) & 0xffU));
+    }
+}
+
+template <typename UInt>
+void append_unsigned(std::string& output, UInt value) {
+    for (std::size_t i = 0; i < sizeof(UInt); ++i) {
+        output.push_back(static_cast<char>((value >> (i * 8U)) & 0xffU));
     }
 }
 
@@ -117,6 +127,87 @@ void write_valid_symlink_archive(const fs::path& archive) {
                  static_cast<std::streamsize>(link_target.size()));
 }
 
+void write_invalid_v3_archive(const fs::path& archive,
+                              std::uint32_t metadata_size) {
+    std::ofstream output(archive, std::ios::binary);
+    output.write("BKMASTR1", 8);
+    write_unsigned<std::uint32_t>(output, 3);
+    write_unsigned<std::uint64_t>(output, 1);
+    write_unsigned<std::uint8_t>(
+        output, static_cast<std::uint8_t>(backup::EntryType::directory));
+    write_unsigned<std::uint32_t>(output, 1);
+    write_unsigned<std::uint32_t>(output, metadata_size);
+    write_unsigned<std::uint64_t>(output, 0);
+    write_unsigned<std::uint64_t>(output, 14695981039346656037ULL);
+    output.put('d');
+}
+
+void write_unknown_version_archive(const fs::path& archive) {
+    std::ofstream output(archive, std::ios::binary);
+    output.write("BKMASTR1", 8);
+    write_unsigned<std::uint32_t>(output, 99);
+    write_unsigned<std::uint64_t>(output, 0);
+}
+
+void write_restore_failure_archive(const fs::path& archive) {
+    std::ofstream output(archive, std::ios::binary);
+    output.write("BKMASTR1", 8);
+    write_unsigned<std::uint32_t>(output, 1);
+    write_unsigned<std::uint64_t>(output, 2);
+    const auto write_file_entry = [&](const std::string& path,
+                                      const std::string& data,
+                                      std::uint64_t stored_checksum) {
+        write_unsigned<std::uint8_t>(
+            output, static_cast<std::uint8_t>(backup::EntryType::file));
+        write_unsigned<std::uint32_t>(
+            output, static_cast<std::uint32_t>(path.size()));
+        write_unsigned<std::uint64_t>(output, data.size());
+        write_unsigned<std::uint64_t>(output, stored_checksum);
+        output.write(path.data(), static_cast<std::streamsize>(path.size()));
+        output.write(data.data(), static_cast<std::streamsize>(data.size()));
+    };
+    write_file_entry("first.txt", "first", checksum("first"));
+    write_file_entry("second.txt", "second", checksum("second") + 1U);
+}
+
+void write_unrestorable_metadata_archive(const fs::path& archive) {
+    const std::string path = "metadata.txt";
+    const std::string data = "metadata restore modes";
+    std::string metadata;
+    append_unsigned<std::uint8_t>(metadata, 1);   // Windows platform.
+    append_unsigned<std::uint8_t>(metadata, 1);   // Metadata schema.
+    append_unsigned<std::uint16_t>(metadata, 7);  // All fields present.
+    for (int i = 0; i < 4; ++i) {
+        append_unsigned<std::uint64_t>(metadata, 0);
+    }
+    append_unsigned<std::uint32_t>(metadata, 0x20);  // FILE_ATTRIBUTE_ARCHIVE.
+    append_unsigned<std::uint32_t>(metadata, 0);     // Empty owner text.
+    append_unsigned<std::uint32_t>(metadata, 20);    // Descriptor size.
+    metadata.push_back(1);                            // SD revision.
+    metadata.push_back(0);
+    append_unsigned<std::uint16_t>(metadata, 0x8000); // SE_SELF_RELATIVE.
+    for (int i = 0; i < 4; ++i) {
+        append_unsigned<std::uint32_t>(metadata, 0);  // No owner/group/ACL.
+    }
+
+    std::ofstream output(archive, std::ios::binary);
+    output.write("BKMASTR1", 8);
+    write_unsigned<std::uint32_t>(output, 3);
+    write_unsigned<std::uint64_t>(output, 1);
+    write_unsigned<std::uint8_t>(
+        output, static_cast<std::uint8_t>(backup::EntryType::file));
+    write_unsigned<std::uint32_t>(output,
+                                  static_cast<std::uint32_t>(path.size()));
+    write_unsigned<std::uint32_t>(
+        output, static_cast<std::uint32_t>(metadata.size()));
+    write_unsigned<std::uint64_t>(output, data.size());
+    write_unsigned<std::uint64_t>(output, checksum(metadata + data));
+    output.write(path.data(), static_cast<std::streamsize>(path.size()));
+    output.write(metadata.data(),
+                 static_cast<std::streamsize>(metadata.size()));
+    output.write(data.data(), static_cast<std::streamsize>(data.size()));
+}
+
 bool can_create_symlinks(const fs::path& root) {
     const auto target = root / "symlink-probe-target";
     const auto link = root / "symlink-probe-link";
@@ -136,6 +227,15 @@ bool can_create_symlinks(const fs::path& root) {
         return false;
     }
     throw std::system_error(creation_error, "cannot probe symbolic-link support");
+}
+
+const backup::EntryInfo* find_entry(
+    const std::vector<backup::EntryInfo>& entries, const std::string& path) {
+    const auto found = std::find_if(entries.begin(), entries.end(),
+                                    [&](const auto& entry) {
+                                        return entry.path == path;
+                                    });
+    return found == entries.end() ? nullptr : &*found;
 }
 
 class CurrentPathGuard {
@@ -176,8 +276,35 @@ int main() {
                 "is_directory rejected a directory");
         require(!backup::is_directory(backup::EntryType::directory_symlink),
                 "is_directory treated a symlink as a real directory");
+#ifdef _WIN32
+        require(entries.front().metadata.platform ==
+                    backup::MetadataPlatform::windows &&
+                    entries.front().metadata.windows.has_value() &&
+                    !entries.front().metadata.windows->owner_sid.empty() &&
+                    !entries.front()
+                         .metadata.windows->security_descriptor.empty(),
+                "v3 archive did not expose Windows metadata");
+#endif
 
-        service.restore(archive, restored);
+        const auto restore_result = service.restore(archive, restored);
+        static_cast<void>(restore_result);
+#ifdef _WIN32
+        const auto* archived_hello = find_entry(entries, "hello.txt");
+        std::error_code restored_metadata_error;
+        const auto restored_metadata = backup::metadata::capture(
+            restored / "hello.txt", false, restored_metadata_error);
+        require(!restored_metadata_error && archived_hello != nullptr &&
+                    archived_hello->metadata.windows &&
+                    restored_metadata.windows &&
+                    restored_metadata.windows->write_time ==
+                        archived_hello->metadata.windows->write_time &&
+                    restored_metadata.windows->owner_sid ==
+                        archived_hello->metadata.windows->owner_sid,
+                "Windows owner or modification time was not restored");
+#else
+        require(restore_result.warnings.empty(),
+                "metadata-free restore emitted warnings");
+#endif
         require(read_file(restored / "hello.txt") == "hello\n",
                 "text file differs after restore");
         require(read_file(restored / "nested" / "data.bin") ==
@@ -226,6 +353,271 @@ int main() {
                         backup::EntryType::file_symlink &&
                     valid_link_entries.back().link_target == "target.txt",
                 "list did not read a valid symlink entry");
+
+        const auto invalid_metadata_archive = root / "invalid-metadata.bkm";
+        write_invalid_v3_archive(invalid_metadata_archive, 1);
+        require_throws(
+            [&] { static_cast<void>(service.list(invalid_metadata_archive)); },
+            "list accepted malformed v3 metadata");
+        const auto oversized_metadata_archive =
+            root / "oversized-metadata.bkm";
+        write_invalid_v3_archive(oversized_metadata_archive,
+                                 1024U * 1024U + 1U);
+        require_throws(
+            [&] { service.verify(oversized_metadata_archive); },
+            "verify accepted oversized v3 metadata");
+        const auto unknown_version_archive = root / "unknown-version.bkm";
+        write_unknown_version_archive(unknown_version_archive);
+        require_throws([&] { service.verify(unknown_version_archive); },
+                       "verify accepted an unknown archive version");
+
+        const auto restore_failure_archive = root / "restore-failure.bkm";
+        const auto failed_destination = root / "failed-destination";
+        write_restore_failure_archive(restore_failure_archive);
+        require_throws(
+            [&] { service.restore(restore_failure_archive, failed_destination); },
+            "restore accepted corrupt file data");
+        require(!fs::exists(failed_destination),
+                "failed restore left a partial destination");
+
+        const auto unrestorable_metadata_archive =
+            root / "unrestorable-metadata.bkm";
+        write_unrestorable_metadata_archive(unrestorable_metadata_archive);
+        service.verify(unrestorable_metadata_archive);
+
+        backup::RestoreOptions best_effort;
+        best_effort.metadata = backup::MetadataRestoreMode::best_effort;
+        const auto best_effort_destination = root / "best-effort-metadata";
+        const auto best_effort_result = service.restore(
+            unrestorable_metadata_archive, best_effort_destination,
+            best_effort);
+        require(!best_effort_result.warnings.empty() &&
+                    read_file(best_effort_destination / "metadata.txt") ==
+                        "metadata restore modes",
+                "best-effort metadata restore did not preserve content and warn");
+
+        backup::RestoreOptions strict_metadata;
+        strict_metadata.metadata = backup::MetadataRestoreMode::strict;
+        const auto strict_destination = root / "strict-metadata";
+        require_throws(
+            [&] {
+                service.restore(unrestorable_metadata_archive,
+                                strict_destination, strict_metadata);
+            },
+            "strict metadata restore accepted an unappliable descriptor");
+        require(!fs::exists(strict_destination),
+                "strict metadata failure did not roll back the destination");
+
+        backup::RestoreOptions no_metadata_restore;
+        no_metadata_restore.metadata = backup::MetadataRestoreMode::none;
+        const auto no_metadata_destination = root / "no-metadata";
+        const auto no_metadata_result = service.restore(
+            unrestorable_metadata_archive, no_metadata_destination,
+            no_metadata_restore);
+        require(no_metadata_result.warnings.empty() &&
+                    read_file(no_metadata_destination / "metadata.txt") ==
+                        "metadata restore modes",
+                "metadata none mode did not skip unappliable metadata");
+
+        const auto hardlink_source = root / "hardlink-source";
+        const auto hardlink_archive = root / "hardlinks.bkm";
+        const auto hardlink_restored = root / "hardlink-restored";
+        fs::create_directories(hardlink_source);
+        std::ofstream(hardlink_source / "original.txt") << "hardlink data";
+        std::error_code hardlink_error;
+        fs::create_hard_link(hardlink_source / "original.txt",
+                             hardlink_source / "alias.txt", hardlink_error);
+        require(!hardlink_error, "cannot create hardlink for testing");
+        service.backup(hardlink_source, hardlink_archive);
+        service.verify(hardlink_archive);
+        const auto hardlink_entries = service.list(hardlink_archive);
+        require(hardlink_entries.size() == 2,
+                "hardlink archive has the wrong entry count");
+        const auto hardlink_count = std::count_if(
+            hardlink_entries.begin(), hardlink_entries.end(),
+            [](const auto& entry) { return backup::is_hardlink(entry.type); });
+        require(hardlink_count == 1,
+                "hardlinked files were not represented by one reference");
+        backup::RestoreOptions no_metadata;
+        no_metadata.metadata = backup::MetadataRestoreMode::none;
+        service.restore(hardlink_archive, hardlink_restored, no_metadata);
+        require(fs::equivalent(hardlink_restored / "original.txt",
+                               hardlink_restored / "alias.txt"),
+                "restored hardlinks do not share a file identity");
+
+        const auto filter_source = root / "filter-source";
+        fs::create_directories(filter_source / "nested");
+        fs::create_directories(filter_source / "excluded");
+        std::ofstream(filter_source / "alpha.txt") << "alpha";
+        std::ofstream(filter_source / "beta.bin") << std::string(20, 'b');
+        std::ofstream(filter_source / "nested" / "gamma.txt")
+            << std::string(30, 'g');
+        std::ofstream(filter_source / "excluded" / "hidden.txt")
+            << "hidden";
+
+        backup::BackupOptions filter_options;
+        filter_options.archive = root / "filtered.bkm";
+        filter_options.filter.include_paths = {"**/*.txt"};
+        filter_options.filter.exclude_paths = {"excluded/**"};
+        filter_options.filter.names = {"*.txt"};
+        filter_options.filter.minimum_size = 5;
+        filter_options.filter.maximum_size = 30;
+        service.backup(filter_source, filter_options);
+        const auto filtered_entries = service.list(filter_options.archive);
+        require(find_entry(filtered_entries, "alpha.txt") != nullptr &&
+                    find_entry(filtered_entries, "nested/gamma.txt") != nullptr &&
+                    find_entry(filtered_entries, "nested") != nullptr &&
+                    find_entry(filtered_entries, "beta.bin") == nullptr &&
+                    find_entry(filtered_entries, "excluded/hidden.txt") == nullptr,
+                "combined backup filters selected the wrong entries");
+
+#ifdef _WIN32
+        const auto* filtered_alpha = find_entry(filtered_entries, "alpha.txt");
+        require(filtered_alpha != nullptr && filtered_alpha->metadata.windows,
+                "filtered entry has no Windows metadata");
+        backup::BackupOptions metadata_filter_options;
+        metadata_filter_options.archive = root / "metadata-filtered.bkm";
+        metadata_filter_options.filter.names = {"alpha.txt", "gamma.txt"};
+        metadata_filter_options.filter.owners = {
+            filtered_alpha->metadata.windows->owner_sid};
+        metadata_filter_options.filter.creation_time.after = 0;
+        metadata_filter_options.filter.creation_time.before =
+            std::numeric_limits<std::int64_t>::max();
+        metadata_filter_options.filter.modification_time.after = 0;
+        metadata_filter_options.filter.modification_time.before =
+            std::numeric_limits<std::int64_t>::max();
+        metadata_filter_options.filter.access_time.after = 0;
+        metadata_filter_options.filter.access_time.before =
+            std::numeric_limits<std::int64_t>::max();
+        service.backup(filter_source, metadata_filter_options);
+        const auto metadata_filtered =
+            service.list(metadata_filter_options.archive);
+        require(find_entry(metadata_filtered, "alpha.txt") != nullptr &&
+                    find_entry(metadata_filtered, "nested/gamma.txt") != nullptr &&
+                    find_entry(metadata_filtered, "beta.bin") == nullptr,
+                "owner or time filters selected the wrong entries");
+#endif
+
+        backup::BackupOptions type_filter_options;
+        type_filter_options.archive = root / "type-filtered.bkm";
+        type_filter_options.filter.types = {backup::EntryType::directory};
+        service.backup(filter_source, type_filter_options);
+        const auto type_filtered = service.list(type_filter_options.archive);
+        require(!type_filtered.empty() &&
+                    std::all_of(type_filtered.begin(), type_filtered.end(),
+                                [](const auto& entry) {
+                                    return backup::is_directory(entry.type);
+                                }),
+                "type filter included a non-directory entry");
+
+        backup::BackupOptions single_hardlink_options;
+        single_hardlink_options.archive = root / "single-hardlink.bkm";
+        single_hardlink_options.filter.names = {"original.txt"};
+        service.backup(hardlink_source, single_hardlink_options);
+        const auto single_hardlink_entries =
+            service.list(single_hardlink_options.archive);
+        require(single_hardlink_entries.size() == 1 &&
+                    single_hardlink_entries.front().type ==
+                        backup::EntryType::file,
+                "a single selected hardlink path was not stored as a file");
+
+        backup::BackupOptions no_match_options;
+        no_match_options.archive = root / "no-match.bkm";
+        no_match_options.filter.names = {"does-not-exist"};
+        require_throws(
+            [&] { service.backup(filter_source, no_match_options); },
+            "backup accepted a filter with no matching entries");
+        require(!fs::exists(no_match_options.archive),
+                "empty filtered backup created an archive");
+
+#ifdef _WIN32
+        const auto junction_source = root / "junction-source";
+        const auto junction_archive = root / "junctions.bkm";
+        const auto junction_restored = root / "junction-restored";
+        fs::create_directories(junction_source / "target");
+        std::ofstream(junction_source / "target" / "inside.txt")
+            << "junction data";
+        std::error_code junction_error;
+        backup::special_files::create_junction(
+            junction_source / "target", junction_source / "joined",
+            junction_error);
+        if (!junction_error) {
+            service.backup(junction_source, junction_archive);
+            service.verify(junction_archive);
+            const auto junction_entries = service.list(junction_archive);
+            const auto* junction = find_entry(junction_entries, "joined");
+            require(junction != nullptr &&
+                        junction->type == backup::EntryType::junction &&
+                        junction->link_target == "target",
+                    "list did not report the internal junction");
+            service.restore(junction_archive, junction_restored, no_metadata);
+            require(backup::special_files::is_junction(
+                        junction_restored / "joined", junction_error),
+                    "junction was not restored as a junction");
+            require(read_file(junction_restored / "joined" / "inside.txt") ==
+                        "junction data",
+                    "restored junction points to the wrong target");
+
+            backup::BackupOptions junction_filter_options;
+            junction_filter_options.archive = root / "junction-filtered.bkm";
+            junction_filter_options.filter.types = {
+                backup::EntryType::junction};
+            service.backup(junction_source, junction_filter_options);
+            const auto junction_filtered =
+                service.list(junction_filter_options.archive);
+            require(find_entry(junction_filtered, "joined") != nullptr &&
+                        find_entry(junction_filtered, "target") != nullptr,
+                    "junction filter did not add its target dependency");
+
+            backup::BackupOptions excluded_dependency_options;
+            excluded_dependency_options.archive =
+                root / "excluded-junction-target.bkm";
+            excluded_dependency_options.filter.types = {
+                backup::EntryType::junction};
+            excluded_dependency_options.filter.exclude_paths = {"target"};
+            require_throws(
+                [&] {
+                    service.backup(junction_source,
+                                   excluded_dependency_options);
+                },
+                "filter silently crossed an explicit dependency exclusion");
+
+            const auto external_target = root / "external-junction-target";
+            const auto external_source = root / "external-junction-source";
+            fs::create_directories(external_target);
+            fs::create_directories(external_source);
+            backup::special_files::create_junction(
+                external_target, external_source / "joined", junction_error);
+            require(!junction_error,
+                    "cannot create external junction for testing");
+            require_throws(
+                [&] {
+                    service.backup(external_source,
+                                   root / "external-junction.bkm");
+                },
+                "backup accepted a junction outside the source tree");
+
+            const auto cycle_source = root / "junction-cycle-source";
+            fs::create_directories(cycle_source / "anchor");
+            backup::special_files::create_junction(
+                cycle_source / "anchor", cycle_source / "anchor" / "loop",
+                junction_error);
+            require(!junction_error,
+                    "cannot create junction cycle for testing");
+            require_throws(
+                [&] {
+                    service.backup(cycle_source,
+                                   root / "junction-cycle.bkm");
+                },
+                "backup accepted a junction directory cycle");
+            fs::remove(cycle_source / "anchor" / "loop", junction_error);
+            require(!junction_error,
+                    "cannot remove junction cycle after testing");
+        } else {
+            std::cout << "Junction tests skipped: "
+                      << junction_error.message() << '\n';
+        }
+#endif
 
         if (can_create_symlinks(root)) {
             const auto link_source = root / "link-source";
