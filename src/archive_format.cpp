@@ -48,7 +48,7 @@ bool valid_type(std::uint8_t raw_type, std::uint32_t version) {
          raw_type == static_cast<std::uint8_t>(EntryType::directory_symlink))) {
         return true;
     }
-    return version >= kCurrentVersion &&
+    return version >= kMetadataVersion &&
            (raw_type == static_cast<std::uint8_t>(EntryType::junction) ||
             raw_type == static_cast<std::uint8_t>(EntryType::hardlink));
 }
@@ -66,7 +66,9 @@ std::string portable_path(const fs::path& path) {
 fs::path checked_relative_path(const std::string& stored) {
     if (stored.empty() || stored.size() > kMaxPathBytes ||
         stored.find('\\') != std::string::npos ||
-        stored.find('\0') != std::string::npos) {
+        stored.find(':') != std::string::npos ||
+        stored.find('\0') != std::string::npos || stored.front() == '/' ||
+        stored.back() == '/' || stored.find("//") != std::string::npos) {
         fail("archive contains an invalid path");
     }
     const fs::path path = fs::u8path(stored);
@@ -131,6 +133,8 @@ void write_entry_header(std::ostream& output, const SourceEntry& entry,
                    static_cast<std::uint32_t>(entry.encoded_metadata.size()));
     write_unsigned(output, entry.data_size);
     write_unsigned(output, checksum);
+    write_unsigned(output, entry.codec);
+    write_unsigned(output, entry.original_size);
     output.write(entry.relative.data(),
                  static_cast<std::streamsize>(entry.relative.size()));
     if (!entry.encoded_metadata.empty()) {
@@ -148,12 +152,18 @@ DecodedEntry read_entry_header(std::istream& input, std::uint32_t version) {
         fail("archive contains an unknown entry type");
     }
     const auto path_size = read_unsigned<std::uint32_t>(input, "path length");
-    const auto metadata_size = version >= kCurrentVersion
+    const auto metadata_size = version >= kMetadataVersion
                                    ? read_unsigned<std::uint32_t>(
                                          input, "metadata length")
                                    : 0U;
     const auto data_size = read_unsigned<std::uint64_t>(input, "data size");
     const auto checksum = read_unsigned<std::uint64_t>(input, "checksum");
+    const std::uint8_t codec = version >= kCurrentVersion
+                                   ? read_unsigned<std::uint8_t>(input, "codec")
+                                   : 0;
+    const auto original_size = version >= kCurrentVersion
+                                   ? read_unsigned<std::uint64_t>(input, "original size")
+                                   : data_size;
     if (path_size == 0 || path_size > kMaxPathBytes) {
         fail("archive contains an invalid path length");
     }
@@ -178,6 +188,11 @@ DecodedEntry read_entry_header(std::istream& input, std::uint32_t version) {
     }
 
     const auto type = static_cast<EntryType>(raw_type);
+    if (codec > 1 || (codec != 0 && type != EntryType::file) ||
+        (codec == 0 && original_size != data_size) ||
+        (type != EntryType::file && original_size != data_size)) {
+        fail("archive contains invalid compression fields: " + path);
+    }
     if (is_directory(type) && data_size != 0) {
         fail("directory entry has non-zero data size");
     }
@@ -185,9 +200,10 @@ DecodedEntry read_entry_header(std::istream& input, std::uint32_t version) {
         fail("archive reference target is too long: " + path);
     }
 
-    EntryInfo info{path, type, data_size, checksum, {},
+    EntryInfo info{path, type, original_size, checksum, {},
                    decode_metadata(encoded_metadata)};
-    return {std::move(info), data_size, std::move(encoded_metadata)};
+    return {std::move(info), data_size, codec, original_size,
+            std::move(encoded_metadata)};
 }
 
 void copy_exact(std::istream& input, std::ostream* output, std::uint64_t size,

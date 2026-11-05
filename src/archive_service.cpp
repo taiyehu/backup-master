@@ -2,6 +2,7 @@
 
 #include "archive_internal.hpp"
 #include "backup/symlink.hpp"
+#include "compression.hpp"
 #include "metadata.hpp"
 #include "special_files.hpp"
 
@@ -76,7 +77,12 @@ std::vector<EntryInfo> read_manifest(const fs::path& archive,
         std::uint64_t checksum = checksum_bytes(entry.encoded_metadata);
         if (entry.info.type == EntryType::file) {
             if (verify_file_data) {
-                copy_exact(input, nullptr, entry.data_size, checksum);
+                if (entry.codec == 1) {
+                    compression::decode_rle(input, nullptr, entry.data_size,
+                                            entry.original_size, checksum);
+                } else {
+                    copy_exact(input, nullptr, entry.data_size, checksum);
+                }
                 if (checksum != entry.info.checksum) {
                     fail("checksum mismatch: " + entry.info.path);
                 }
@@ -156,6 +162,19 @@ fs::path ArchiveService::backup(const fs::path& source,
     const fs::path archive = options.archive.empty()
                                  ? make_default_archive_path()
                                  : options.archive;
+    std::error_code location_error;
+    const auto archive_parent = fs::weakly_canonical(
+        fs::absolute(archive).parent_path(), location_error);
+    const auto source_root = fs::canonical(source, location_error);
+    if (location_error) {
+        fail("cannot resolve archive or source location: " +
+             location_error.message());
+    }
+    const auto relative_parent = archive_parent.lexically_relative(source_root);
+    if (!relative_parent.empty() &&
+        (relative_parent == "." || *relative_parent.begin() != "..")) {
+        fail("archive destination must be outside the source directory");
+    }
     if (fs::exists(archive)) {
         fail("archive already exists; choose a new path or remove it explicitly");
     }
@@ -173,30 +192,50 @@ fs::path ArchiveService::backup(const fs::path& source,
     }
     try {
         write_header(output, entries.size());
-        for (const auto& entry : entries) {
+        for (auto entry : entries) {
             const auto metadata_checksum =
                 checksum_bytes(entry.encoded_metadata);
-            const auto checksum = entry.type == EntryType::file
-                                      ? checksum_file(entry.absolute,
-                                                      metadata_checksum)
-                                      : (has_reference_target(entry.type)
-                                             ? checksum_bytes(
-                                                   entry.reference_target,
-                                                   metadata_checksum)
-                                             : metadata_checksum);
+            entry.original_size = entry.data_size;
+            std::uint64_t checksum = metadata_checksum;
+            if (entry.type == EntryType::file) {
+                const auto compressed = compression::encode_file(
+                    entry.absolute, entry.original_size, metadata_checksum,
+                    nullptr);
+                if (compressed.size < entry.original_size) {
+                    entry.codec = 1;
+                    entry.data_size = compressed.size;
+                    checksum = compressed.checksum;
+                } else {
+                    checksum = checksum_file(entry.absolute, metadata_checksum);
+                }
+            } else if (has_reference_target(entry.type)) {
+                checksum = checksum_bytes(entry.reference_target,
+                                          metadata_checksum);
+            }
             write_entry_header(output, entry, checksum);
             if (entry.type == EntryType::file) {
-                std::ifstream input(entry.absolute, std::ios::binary);
-                if (!input) {
-                    fail("cannot open source file: " +
-                         portable_path(entry.absolute));
-                }
-                std::uint64_t copied_checksum = metadata_checksum;
-                copy_exact(input, &output, entry.data_size, copied_checksum);
-                if (copied_checksum != checksum ||
-                    input.peek() != std::char_traits<char>::eof()) {
-                    fail("source file changed during backup: " +
-                         portable_path(entry.absolute));
+                if (entry.codec == 1) {
+                    const auto written = compression::encode_file(
+                        entry.absolute, entry.original_size,
+                        metadata_checksum, &output);
+                    if (written.size != entry.data_size ||
+                        written.checksum != checksum) {
+                        fail("source file changed during backup: " +
+                             portable_path(entry.absolute));
+                    }
+                } else {
+                    std::ifstream input(entry.absolute, std::ios::binary);
+                    if (!input) {
+                        fail("cannot open source file: " +
+                             portable_path(entry.absolute));
+                    }
+                    std::uint64_t copied_checksum = metadata_checksum;
+                    copy_exact(input, &output, entry.data_size, copied_checksum);
+                    if (copied_checksum != checksum ||
+                        input.peek() != std::char_traits<char>::eof()) {
+                        fail("source file changed during backup: " +
+                             portable_path(entry.absolute));
+                    }
                 }
             } else if (has_reference_target(entry.type)) {
                 output.write(entry.reference_target.data(),
@@ -282,7 +321,12 @@ RestoreResult ArchiveService::restore(const fs::path& archive,
             if (!output) {
                 fail("cannot create restored file: " + entry.info.path);
             }
-            copy_exact(input, &output, entry.data_size, checksum);
+            if (entry.codec == 1) {
+                compression::decode_rle(input, &output, entry.data_size,
+                                        entry.original_size, checksum);
+            } else {
+                copy_exact(input, &output, entry.data_size, checksum);
+            }
             output.close();
             if (!output || checksum != entry.info.checksum) {
                 std::error_code ignored;

@@ -133,7 +133,10 @@ std::vector<SourceEntry> scan_source(const fs::path& source,
                  error.message());
         }
 
-        SourceEntry entry{path, relative, EntryType::file, 0, 0, {}, {}, {}};
+        SourceEntry entry{};
+        entry.absolute = path;
+        entry.relative = relative;
+        entry.type = EntryType::file;
         EntryType source_type = EntryType::file;
         std::optional<special_files::FileIdentity> identity;
         bool open_reparse = false;

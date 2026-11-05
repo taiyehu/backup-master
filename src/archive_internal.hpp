@@ -15,7 +15,8 @@ namespace fs = std::filesystem;
 
 constexpr std::uint32_t kLegacyVersion = 1;
 constexpr std::uint32_t kSymlinkVersion = 2;
-constexpr std::uint32_t kCurrentVersion = 3;
+constexpr std::uint32_t kMetadataVersion = 3;
+constexpr std::uint32_t kCurrentVersion = 4;
 constexpr std::uint32_t kMaxPathBytes = 1024U * 1024U;
 constexpr std::uint32_t kMaxMetadataBytes = 1024U * 1024U;
 constexpr std::uint64_t kMaxReferenceBytes = 32U * 1024U;
@@ -33,6 +34,8 @@ struct SourceEntry {
     std::string relative;
     EntryType type;
     std::uint64_t data_size{};
+    std::uint8_t codec{};
+    std::uint64_t original_size{};
     std::uint64_t logical_size{};
     std::string reference_target;
     FileMetadata metadata;
@@ -42,6 +45,8 @@ struct SourceEntry {
 struct DecodedEntry {
     EntryInfo info;
     std::uint64_t data_size{};
+    std::uint8_t codec{};
+    std::uint64_t original_size{};
     std::vector<std::uint8_t> encoded_metadata;
 };
 

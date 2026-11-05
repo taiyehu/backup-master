@@ -38,7 +38,7 @@ const char* type_name(backup::EntryType type) {
 
 void print_usage(std::ostream& output) {
     output
-        << "BackupMaster 0.3.0\nUsage:\n"
+        << "BackupMaster 0.4.0\nUsage:\n"
         << "  backup-master backup <source> [archive.bkm] [filters]\n"
         << "  backup-master restore <archive.bkm> <destination> "
            "[--metadata best-effort|strict|none]\n"

@@ -149,6 +149,62 @@ void write_unknown_version_archive(const fs::path& archive) {
     write_unsigned<std::uint64_t>(output, 0);
 }
 
+void write_single_entry_archive(const fs::path& archive,
+                                std::uint32_t version,
+                                std::uint8_t type,
+                                const std::string& path,
+                                const std::string& data,
+                                std::uint64_t stored_checksum) {
+    std::ofstream output(archive, std::ios::binary);
+    output.write("BKMASTR1", 8);
+    write_unsigned<std::uint32_t>(output, version);
+    write_unsigned<std::uint64_t>(output, 1);
+    write_unsigned<std::uint8_t>(output, type);
+    write_unsigned<std::uint32_t>(output,
+                                  static_cast<std::uint32_t>(path.size()));
+    if (version >= 3) write_unsigned<std::uint32_t>(output, 0);
+    write_unsigned<std::uint64_t>(output, data.size());
+    write_unsigned<std::uint64_t>(output, stored_checksum);
+    if (version >= 4) {
+        write_unsigned<std::uint8_t>(output, 0);
+        write_unsigned<std::uint64_t>(output, data.size());
+    }
+    output.write(path.data(), static_cast<std::streamsize>(path.size()));
+    output.write(data.data(), static_cast<std::streamsize>(data.size()));
+}
+
+void write_malformed_rle_archive(const fs::path& archive) {
+    const std::string data{static_cast<char>(255), 'x'};
+    std::ofstream output(archive, std::ios::binary);
+    output.write("BKMASTR1", 8);
+    write_unsigned<std::uint32_t>(output, 4);
+    write_unsigned<std::uint64_t>(output, 1);
+    write_unsigned<std::uint8_t>(output, 1);
+    write_unsigned<std::uint32_t>(output, 1);
+    write_unsigned<std::uint32_t>(output, 0);
+    write_unsigned<std::uint64_t>(output, data.size());
+    write_unsigned<std::uint64_t>(output, checksum(data));
+    write_unsigned<std::uint8_t>(output, 1);
+    write_unsigned<std::uint64_t>(output, 1);
+    output.put('x');
+    output.write(data.data(), static_cast<std::streamsize>(data.size()));
+}
+
+void write_duplicate_archive(const fs::path& archive) {
+    std::ofstream output(archive, std::ios::binary);
+    output.write("BKMASTR1", 8);
+    write_unsigned<std::uint32_t>(output, 1);
+    write_unsigned<std::uint64_t>(output, 2);
+    for (int i = 0; i < 2; ++i) {
+        write_unsigned<std::uint8_t>(output, 1);
+        write_unsigned<std::uint32_t>(output, 1);
+        write_unsigned<std::uint64_t>(output, 1);
+        write_unsigned<std::uint64_t>(output, checksum("x"));
+        output.put('x');
+        output.put('x');
+    }
+}
+
 void write_restore_failure_archive(const fs::path& archive) {
     std::ofstream output(archive, std::ios::binary);
     output.write("BKMASTR1", 8);
@@ -317,6 +373,11 @@ int main() {
 
         require_throws([&] { service.backup(source, archive); },
                        "backup unexpectedly overwrote an existing archive");
+        const auto self_archive = source / "nested" / "self.bkm";
+        require_throws([&] { service.backup(source, self_archive); },
+                       "backup accepted an archive inside the source tree");
+        require(!fs::exists(self_archive),
+                "rejected in-tree archive left an output file");
 
         {
             std::ofstream corrupt(archive, std::ios::binary | std::ios::app);
@@ -343,6 +404,63 @@ int main() {
         service.restore(legacy_archive, legacy_restored);
         require(read_file(legacy_restored / "legacy.txt") == "legacy data",
                 "v1 archive was not restored correctly");
+
+        const auto v3_archive = root / "v3.bkm";
+        write_single_entry_archive(v3_archive, 3, 1, "v3.txt", "v3 data",
+                                   checksum("v3 data"));
+        service.verify(v3_archive);
+        service.restore(v3_archive, root / "v3-restored");
+        require(read_file(root / "v3-restored" / "v3.txt") == "v3 data",
+                "v3 archive did not restore correctly");
+
+        const std::vector<std::string> invalid_paths{
+            "../escape", "a/../escape", "a//b", "a/./b", "C:/escape"};
+        for (std::size_t index = 0; index < invalid_paths.size(); ++index) {
+            const auto invalid = root / ("unsafe-path-" +
+                                         std::to_string(index) + ".bkm");
+            write_single_entry_archive(invalid, 1, 1,
+                                       invalid_paths[index], "x", checksum("x"));
+            require_throws([&] { service.verify(invalid); },
+                           "verify accepted an unsafe archive path");
+        }
+        const auto unknown_type_archive = root / "unknown-type.bkm";
+        write_single_entry_archive(unknown_type_archive, 1, 99, "x", "x",
+                                   checksum("x"));
+        require_throws([&] { service.verify(unknown_type_archive); },
+                       "verify accepted an unknown entry type");
+        const auto duplicate_archive = root / "duplicate.bkm";
+        write_duplicate_archive(duplicate_archive);
+        require_throws([&] { service.verify(duplicate_archive); },
+                       "verify accepted duplicate paths");
+        const auto wrong_checksum_archive = root / "wrong-checksum.bkm";
+        write_single_entry_archive(wrong_checksum_archive, 1, 1, "x", "x",
+                                   checksum("x") + 1);
+        require_throws([&] { service.verify(wrong_checksum_archive); },
+                       "verify accepted a bad checksum");
+        const auto truncated_archive = root / "truncated.bkm";
+        write_single_entry_archive(truncated_archive, 1, 1, "x", "x",
+                                   checksum("x"));
+        fs::resize_file(truncated_archive, fs::file_size(truncated_archive) - 1);
+        require_throws([&] { service.verify(truncated_archive); },
+                       "verify accepted truncated file data");
+
+        const auto compressed_source = root / "compressed-source";
+        fs::create_directories(compressed_source);
+        const std::string repetitive(200000, 'R');
+        std::ofstream(compressed_source / "repeat.bin", std::ios::binary)
+            << repetitive;
+        const auto compressed_archive = root / "compressed.bkm";
+        service.backup(compressed_source, compressed_archive);
+        require(fs::file_size(compressed_archive) < repetitive.size(),
+                "v4 RLE did not reduce repetitive data");
+        service.verify(compressed_archive);
+        service.restore(compressed_archive, root / "compressed-restored");
+        require(read_file(root / "compressed-restored" / "repeat.bin") ==
+                    repetitive, "v4 compressed data did not round trip");
+        const auto malformed_rle_archive = root / "malformed-rle.bkm";
+        write_malformed_rle_archive(malformed_rle_archive);
+        require_throws([&] { service.verify(malformed_rle_archive); },
+                       "verify accepted RLE expansion beyond original size");
 
         const auto valid_link_archive = root / "valid-link.bkm";
         write_valid_symlink_archive(valid_link_archive);
